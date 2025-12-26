@@ -1,0 +1,17 @@
+﻿# Large data / generated artifacts
+data/raw/*
+data/processed/*
+data/tokenizer/*
+
+# Keep folder placeholders
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/tokenizer/.gitkeep
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
