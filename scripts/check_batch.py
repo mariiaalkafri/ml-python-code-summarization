@@ -1,51 +1,48 @@
+import sys
 import os
 import torch
 from torch.utils.data import DataLoader
-from tokenizers import Tokenizer
+
+# Ensure we can import from src
+sys.path.append(os.path.abspath("."))
 
 from src.data import JsonlCodeSummaryDataset, Collator
 
-def main():
+def check_batch():
     tokenizer_path = "data/tokenizer/tokenizer.json"
-    train_path = "data/processed/train.jsonl"
-
+    data_path = "data/processed/train.jsonl"
+    
     print(f"Loading tokenizer from {tokenizer_path}...")
-    tok = Tokenizer.from_file(tokenizer_path)
-
-    print(f"Loading dataset from {train_path}...")
-    ds = JsonlCodeSummaryDataset(train_path)
-
-    # Match your training settings here
-    max_src_len = 256
-    max_tgt_len = 64
-    batch_size = 4
-
-    collator = Collator(tokenizer_path, max_src_len=max_src_len, max_tgt_len=max_tgt_len)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collator)
-
+    collator = Collator(tokenizer_path, max_src_len=256, max_tgt_len=64)
+    
+    print(f"Loading dataset from {data_path}...")
+    dataset = JsonlCodeSummaryDataset(data_path)
+    
+    loader = DataLoader(dataset, batch_size=4, shuffle=False, collate_fn=collator)
+    
     print("Fetching one batch...")
     batch = next(iter(loader))
-
-    print("Source IDs shape:", batch.src_ids.shape)
-    print("Source Mask shape:", batch.src_mask.shape)
-    print("Target IDs shape:", batch.tgt_ids.shape)
-
-    # Inspect special tokens
+    
+    print(f"Source IDs shape: {batch.src_ids.shape}")
+    print(f"Source Mask shape: {batch.src_mask.shape}")
+    print(f"Target IDs shape: {batch.tgt_ids.shape}")
+    
+    first_tgt = batch.tgt_ids[0].tolist()
+    print(f"First target sequence (IDs): {first_tgt}")
+    
+    # Check BOS/EOS
     bos_id = collator.bos_id
     eos_id = collator.eos_id
-
-    first = batch.tgt_ids[0].tolist()
-    print("First target sequence (IDs):", first)
-
-    if first[0] == bos_id:
+    
+    if first_tgt[0] == bos_id:
         print("PASS: First token is <bos>")
     else:
-        print("FAIL: First token is NOT <bos>")
-
-    if eos_id in first:
+        print(f"FAIL: First token is {first_tgt[0]}, expected <bos> ({bos_id})")
+        
+    if eos_id in first_tgt:
         print("PASS: <eos> token found in sequence")
     else:
-        print("FAIL: <eos> token NOT found")
+        print(f"FAIL: <eos> token NOT found in sequence (might be truncated if too long, or error)")
 
 if __name__ == "__main__":
-    main()
+    check_batch()
