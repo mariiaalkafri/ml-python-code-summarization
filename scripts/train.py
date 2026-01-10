@@ -15,15 +15,10 @@ from src.train_utils import train_model
 
 def pick_length_stratified_subset(examples: List[Dict], n: int, seed: int = 42, buckets: int = 5):
     """
-    Picks a representative subset by stratifying examples by code length.
-    This avoids bias from taking the first N rows and ensures we keep short/medium/long code.
-
-    - examples: list of {"code":..., "summary":...}
-    - n: subset size (if n >= len(examples), returns full list)
-    - seed: reproducible sampling
-    - buckets: number of length buckets (default 5)
+    Select a representative subset by stratifying by code length.
+    Ensures short, medium, and long samples are included.
     """
-    if n is None or n <= 0 or n >= len(examples):
+    if n is None or n >= len(examples):
         return examples
 
     rng = random.Random(seed)
@@ -31,25 +26,22 @@ def pick_length_stratified_subset(examples: List[Dict], n: int, seed: int = 42, 
     # Sort by code length
     sorted_ex = sorted(examples, key=lambda x: len(x.get("code", "")))
 
-    # Split into buckets by interleaving to keep buckets balanced
-    b = max(2, int(buckets))
-    bucket_lists = [sorted_ex[i::b] for i in range(b)]
+    # Split into buckets
+    bucket_lists = [sorted_ex[i::buckets] for i in range(buckets)]
 
-    base = n // b
-    extra = n % b
-    quotas = [base + (1 if i < extra else 0) for i in range(b)]
+    base = n // buckets
+    remainder = n % buckets
+    quotas = [base + (1 if i < remainder else 0) for i in range(buckets)]
 
-    picked = []
+    subset = []
     for bucket, q in zip(bucket_lists, quotas):
-        if not bucket:
-            continue
         if q >= len(bucket):
-            picked.extend(bucket)
+            subset.extend(bucket)
         else:
-            picked.extend(rng.sample(bucket, q))
+            subset.extend(rng.sample(bucket, q))
 
-    rng.shuffle(picked)
-    return picked
+    rng.shuffle(subset)
+    return subset
 
 
 def main():
@@ -59,46 +51,46 @@ def main():
     val_path = "data/processed/valid.jsonl"
 
     # -----------------------------
-    # SPEED / QUALITY SETTINGS
+    # TRAINING SETTINGS
     # -----------------------------
-    # Sequence lengths (major speed lever for attention models)
     batch_size = 16
     max_src_len = 256
     max_tgt_len = 64
 
-    # Training schedule
     epochs = 10
     lr = 3e-4
     weight_decay = 0.01
 
-    # SUBSET SETTINGS (set to None for full training)
-    # Recommended starting point:
-    SUBSET_TRAIN = 100_000   # try 50_000 / 100_000 / 150_000
-    SUBSET_VAL   = 10_000
+    # 🔥 SUBSET SETTINGS (FINAL)
+    SUBSET_TRAIN = 50_000
+    SUBSET_VAL = 5_000
     SEED = 42
     # -----------------------------
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Data + Tokenizer (through collator)
+    # Collator / tokenizer
     collator = Collator(tokenizer_path, max_src_len=max_src_len, max_tgt_len=max_tgt_len)
-    vocab_size = collator.tokenizer.get_vocab_size()
     pad_id = collator.pad_id
+    vocab_size = collator.tokenizer.get_vocab_size()
 
+    # Load datasets
     print("Loading datasets...")
     train_dataset = JsonlCodeSummaryDataset(train_path)
     val_dataset = JsonlCodeSummaryDataset(val_path)
 
-    # Apply subset selection (ONLY affects training time, not correctness)
-    # Dataset uses `.examples` in your implementation.
-    if hasattr(train_dataset, "examples") and isinstance(train_dataset.examples, list):
-        train_dataset.examples = pick_length_stratified_subset(train_dataset.examples, SUBSET_TRAIN, seed=SEED)
-    if hasattr(val_dataset, "examples") and isinstance(val_dataset.examples, list):
-        val_dataset.examples = pick_length_stratified_subset(val_dataset.examples, SUBSET_VAL, seed=SEED)
+    # Apply subset selection
+    train_dataset.examples = pick_length_stratified_subset(
+        train_dataset.examples, SUBSET_TRAIN, seed=SEED
+    )
+    val_dataset.examples = pick_length_stratified_subset(
+        val_dataset.examples, SUBSET_VAL, seed=SEED
+    )
 
-    print(f"Using subset sizes: train={len(train_dataset)}  val={len(val_dataset)}")
+    print(f"Using subset: train={len(train_dataset)}  val={len(val_dataset)}")
 
+    # DataLoaders
     print("Building dataloaders...")
     train_loader = DataLoader(
         train_dataset,
@@ -106,7 +98,7 @@ def main():
         shuffle=True,
         collate_fn=collator,
         num_workers=2,
-        pin_memory=True,
+        pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset,
@@ -114,7 +106,7 @@ def main():
         shuffle=False,
         collate_fn=collator,
         num_workers=2,
-        pin_memory=True,
+        pin_memory=True
     )
 
     # Model
