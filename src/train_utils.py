@@ -13,7 +13,7 @@ class EarlyStopping:
         self.best_loss = None
         self.early_stop = False
 
-    def __call__(self, val_loss):
+    def __call__(self, val_loss: float):
         if self.best_loss is None:
             self.best_loss = val_loss
             self.counter = 0
@@ -50,6 +50,7 @@ def run_epoch(model, dataloader, optimizer, criterion, device,
         src_mask = batch.src_mask.to(device, non_blocking=True)
         tgt_ids = batch.tgt_ids.to(device, non_blocking=True)
 
+        # teacher forcing inputs/targets
         tgt_in = tgt_ids[:, :-1]
         tgt_out = tgt_ids[:, 1:]
 
@@ -57,8 +58,10 @@ def run_epoch(model, dataloader, optimizer, criterion, device,
             optimizer.zero_grad()
 
             logits = model(src_ids, src_mask, tgt_in)
-            output_dim = logits.shape[-1]
-            loss = criterion(logits.reshape(-1, output_dim), tgt_out.reshape(-1))
+            loss = criterion(
+                logits.reshape(-1, logits.size(-1)),
+                tgt_out.reshape(-1)
+            )
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
@@ -67,12 +70,14 @@ def run_epoch(model, dataloader, optimizer, criterion, device,
         else:
             with torch.no_grad():
                 logits = model(src_ids, src_mask, tgt_in)
-                output_dim = logits.shape[-1]
-                loss = criterion(logits.reshape(-1, output_dim), tgt_out.reshape(-1))
+                loss = criterion(
+                    logits.reshape(-1, logits.size(-1)),
+                    tgt_out.reshape(-1)
+                )
 
         total_loss += loss.item()
 
-        # progress printing
+        # show progress so it doesn't look stuck
         if train and (i % log_every == 0):
             print(f"  batch {i}/{len(dataloader)}  loss={loss.item():.4f}")
 
@@ -81,14 +86,14 @@ def run_epoch(model, dataloader, optimizer, criterion, device,
 
 def train_model(model, train_loader, val_loader, device, pad_id,
                 epochs=10, lr=3e-4, weight_decay=0.01,
-                save_dir="models", clip_grad=1.0):
+                save_dir="models", log_every=200, clip_grad=1.0):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=1, min_lr=1e-6
     )
-    early_stopping = EarlyStopping(patience=4, min_delta=0.001)
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+    early_stopping = EarlyStopping(patience=4, min_delta=0.001)
 
     best_val = float("inf")
 
@@ -97,7 +102,7 @@ def train_model(model, train_loader, val_loader, device, pad_id,
 
         train_loss = run_epoch(
             model, train_loader, optimizer, criterion, device,
-            train=True, clip_grad=clip_grad, log_every=200
+            train=True, clip_grad=clip_grad, log_every=log_every
         )
         val_loss = run_epoch(
             model, val_loader, optimizer, criterion, device,
@@ -112,17 +117,17 @@ def train_model(model, train_loader, val_loader, device, pad_id,
 
         scheduler.step(val_loss)
 
-        # Save last checkpoint every epoch
+        # Save last checkpoint each epoch
         save_checkpoint(f"{save_dir}/last.pt", model, optimizer, epoch, val_loss)
 
-        # Save best checkpoint if improved
+        # Save best checkpoint when validation improves
         if val_loss < best_val:
             best_val = val_loss
             save_checkpoint(f"{save_dir}/best.pt", model, optimizer, epoch, val_loss)
-            print("  ✔ Saved new best checkpoint")
+            print("  ✔ Saved new best model")
 
+        # Early stopping check
         early_stopping(val_loss)
         if early_stopping.early_stop:
             print("Early stopping triggered")
             break
-
