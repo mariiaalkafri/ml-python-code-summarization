@@ -38,8 +38,8 @@ def main():
     val_dataset = JsonlCodeSummaryDataset(val_path)
 
     # Optional: fast smoke test (uncomment for quick verification)
-    # train_dataset.examples = train_dataset.examples[:2000]
-    # val_dataset.examples = val_dataset.examples[:500]
+      train_dataset.examples = train_dataset.examples[:2000]
+      val_dataset.examples = val_dataset.examples[:500]
 
     print("Building dataloaders...")
     train_loader = DataLoader(
