@@ -18,7 +18,7 @@ def check_batch():
     print(f"Loading dataset from {data_path}...")
     dataset = JsonlCodeSummaryDataset(data_path)
     
-    loader = DataLoader(dataset, batch_size=4, shuffle=False, collate_fn=collator)
+    loader = DataLoader(dataset, batch_size=4, shuffle=Ture, collate_fn=collator)
     
     print("Fetching one batch...")
     batch = next(iter(loader))
