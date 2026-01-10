@@ -77,7 +77,6 @@ def run_epoch(model, dataloader, optimizer, criterion, device,
 
         total_loss += loss.item()
 
-        # show progress so it doesn't look stuck
         if train and (i % log_every == 0):
             print(f"  batch {i}/{len(dataloader)}  loss={loss.item():.4f}")
 
