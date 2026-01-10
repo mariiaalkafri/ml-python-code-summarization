@@ -1,7 +1,9 @@
 import sys
 import os
+import random
 import torch
 from torch.utils.data import DataLoader
+from typing import List, Dict
 
 # Ensure we can import from src
 sys.path.append(os.path.abspath("."))
@@ -11,19 +13,70 @@ from src.model import Seq2SeqLSTMAttn
 from src.train_utils import train_model
 
 
+def pick_length_stratified_subset(examples: List[Dict], n: int, seed: int = 42, buckets: int = 5):
+    """
+    Picks a representative subset by stratifying examples by code length.
+    This avoids bias from taking the first N rows and ensures we keep short/medium/long code.
+
+    - examples: list of {"code":..., "summary":...}
+    - n: subset size (if n >= len(examples), returns full list)
+    - seed: reproducible sampling
+    - buckets: number of length buckets (default 5)
+    """
+    if n is None or n <= 0 or n >= len(examples):
+        return examples
+
+    rng = random.Random(seed)
+
+    # Sort by code length
+    sorted_ex = sorted(examples, key=lambda x: len(x.get("code", "")))
+
+    # Split into buckets by interleaving to keep buckets balanced
+    b = max(2, int(buckets))
+    bucket_lists = [sorted_ex[i::b] for i in range(b)]
+
+    base = n // b
+    extra = n % b
+    quotas = [base + (1 if i < extra else 0) for i in range(b)]
+
+    picked = []
+    for bucket, q in zip(bucket_lists, quotas):
+        if not bucket:
+            continue
+        if q >= len(bucket):
+            picked.extend(bucket)
+        else:
+            picked.extend(rng.sample(bucket, q))
+
+    rng.shuffle(picked)
+    return picked
+
+
 def main():
     # Paths
     tokenizer_path = "data/tokenizer/tokenizer.json"
     train_path = "data/processed/train.jsonl"
     val_path = "data/processed/valid.jsonl"
 
-    # Hyperparameters (speed-friendly for Tesla T4)
+    # -----------------------------
+    # SPEED / QUALITY SETTINGS
+    # -----------------------------
+    # Sequence lengths (major speed lever for attention models)
     batch_size = 16
-    max_src_len = 256   # was 512 (huge speed-up)
-    max_tgt_len = 64    # was 128 (huge speed-up)
-    epochs = 10         # early stopping will stop earlier if needed
+    max_src_len = 256
+    max_tgt_len = 64
+
+    # Training schedule
+    epochs = 10
     lr = 3e-4
     weight_decay = 0.01
+
+    # SUBSET SETTINGS (set to None for full training)
+    # Recommended starting point:
+    SUBSET_TRAIN = 100_000   # try 50_000 / 100_000 / 150_000
+    SUBSET_VAL   = 10_000
+    SEED = 42
+    # -----------------------------
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -37,9 +90,14 @@ def main():
     train_dataset = JsonlCodeSummaryDataset(train_path)
     val_dataset = JsonlCodeSummaryDataset(val_path)
 
-    # Optional: fast smoke test (uncomment for quick verification)
-    # train_dataset.examples = train_dataset.examples[:2000]
-    # val_dataset.examples = val_dataset.examples[:500]
+    # Apply subset selection (ONLY affects training time, not correctness)
+    # Dataset uses `.examples` in your implementation.
+    if hasattr(train_dataset, "examples") and isinstance(train_dataset.examples, list):
+        train_dataset.examples = pick_length_stratified_subset(train_dataset.examples, SUBSET_TRAIN, seed=SEED)
+    if hasattr(val_dataset, "examples") and isinstance(val_dataset.examples, list):
+        val_dataset.examples = pick_length_stratified_subset(val_dataset.examples, SUBSET_VAL, seed=SEED)
+
+    print(f"Using subset sizes: train={len(train_dataset)}  val={len(val_dataset)}")
 
     print("Building dataloaders...")
     train_loader = DataLoader(
@@ -50,7 +108,6 @@ def main():
         num_workers=2,
         pin_memory=True,
     )
-
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
