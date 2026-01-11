@@ -1,3 +1,4 @@
+# src/train_utils.py
 import os
 import time
 import torch
@@ -5,128 +6,198 @@ import torch.nn as nn
 import torch.optim as optim
 
 
-class EarlyStopping:
-    def __init__(self, patience=4, min_delta=0.001):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
+# -------------------------
+# Metrics
+# -------------------------
+def token_accuracy(logits: torch.Tensor, targets: torch.Tensor, pad_id: int) -> float:
+    """
+    Token-level accuracy ignoring pad tokens.
+    logits: [B, T, V]
+    targets: [B, T]
+    """
+    preds = logits.argmax(dim=-1)  # [B, T]
+    mask = targets != pad_id
+    correct = (preds == targets) & mask
 
-    def __call__(self, val_loss: float):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-            self.counter = 0
-            return
+    correct_tokens = correct.sum().item()
+    total_tokens = mask.sum().item()
 
-        # improvement means val_loss < best_loss - min_delta
-        if val_loss < self.best_loss - self.min_delta:
-            self.best_loss = val_loss
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
+    if total_tokens == 0:
+        return 0.0
+
+    return correct_tokens / total_tokens
 
 
-def save_checkpoint(path, model, optimizer, epoch, val_loss):
+# -------------------------
+# Checkpointing
+# -------------------------
+def save_checkpoint(path, model, optimizer, epoch, best_val_loss):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    state = {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "val_loss": val_loss,
-    }
-    torch.save(state, path)
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_val_loss": best_val_loss,
+        },
+        path,
+    )
 
 
-def run_epoch(model, dataloader, optimizer, criterion, device,
-              train=True, clip_grad=1.0, log_every=200):
-    model.train() if train else model.eval()
+def load_checkpoint(path, model, optimizer, device):
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    start_epoch = ckpt["epoch"] + 1
+    best_val_loss = ckpt.get("best_val_loss", float("inf"))
+    return start_epoch, best_val_loss
+
+
+# -------------------------
+# One epoch
+# -------------------------
+def run_epoch(
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    pad_id,
+    train=True,
+    clip_grad=1.0,
+    log_every=200,
+):
+    if train:
+        model.train()
+    else:
+        model.eval()
+
     total_loss = 0.0
+    total_acc = 0.0
+    start_time = time.time()
 
     for i, batch in enumerate(dataloader):
-        src_ids = batch.src_ids.to(device, non_blocking=True)
-        src_mask = batch.src_mask.to(device, non_blocking=True)
-        tgt_ids = batch.tgt_ids.to(device, non_blocking=True)
+        src_ids = batch.src_ids.to(device)
+        src_mask = batch.src_mask.to(device)
+        tgt_ids = batch.tgt_ids.to(device)
 
-        # teacher forcing inputs/targets
         tgt_in = tgt_ids[:, :-1]
         tgt_out = tgt_ids[:, 1:]
 
         if train:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            logits = model(src_ids, src_mask, tgt_in)
-            loss = criterion(
-                logits.reshape(-1, logits.size(-1)),
-                tgt_out.reshape(-1)
-            )
+        with torch.set_grad_enabled(train):
+            logits = model(src_ids, src_mask, tgt_in)  # [B, T-1, V]
+            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-            optimizer.step()
+            if train:
+                loss.backward()
+                if clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                optimizer.step()
 
-        else:
-            with torch.no_grad():
-                logits = model(src_ids, src_mask, tgt_in)
-                loss = criterion(
-                    logits.reshape(-1, logits.size(-1)),
-                    tgt_out.reshape(-1)
-                )
+        acc = token_accuracy(logits, tgt_out, pad_id)
 
         total_loss += loss.item()
+        total_acc += acc
 
         if train and (i % log_every == 0):
-            print(f"  batch {i}/{len(dataloader)}  loss={loss.item():.4f}")
+            elapsed = time.time() - start_time
+            print(
+                f"  batch {i}/{len(dataloader)}  "
+                f"loss={loss.item():.4f}  acc={acc:.4f}  time={elapsed:.2f}s"
+            )
 
-    return total_loss / max(1, len(dataloader))
+    return total_loss / max(1, len(dataloader)), total_acc / max(1, len(dataloader))
 
 
-def train_model(model, train_loader, val_loader, device, pad_id,
-                epochs=10, lr=3e-4, weight_decay=0.01,
-                save_dir="models", log_every=200, clip_grad=1.0):
+# -------------------------
+# Full training
+# -------------------------
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    pad_id,
+    epochs=10,
+    lr=3e-4,
+    weight_decay=0.01,
+    clip_grad=1.0,
+    log_every=200,
+    save_dir="models",
+    resume=True,
+):
+    best_path = os.path.join(save_dir, "best.pt")
+    last_path = os.path.join(save_dir, "last.pt")
+
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=1, min_lr=1e-6
     )
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
-    early_stopping = EarlyStopping(patience=4, min_delta=0.001)
 
-    best_val = float("inf")
+    start_epoch = 1
+    best_val_loss = float("inf")
 
-    for epoch in range(1, epochs + 1):
-        start_time = time.time()
+    # Resume if last checkpoint exists
+    if resume and os.path.exists(last_path):
+        try:
+            print(f"Found checkpoint {last_path} — resuming...")
+            start_epoch, best_val_loss = load_checkpoint(last_path, model, optimizer, device)
+            print(f"Resumed from epoch {start_epoch} | best_val_loss={best_val_loss:.4f}")
+        except Exception as e:
+            print("Could not resume, starting fresh. Reason:", e)
 
-        train_loss = run_epoch(
-            model, train_loader, optimizer, criterion, device,
-            train=True, clip_grad=clip_grad, log_every=log_every
+    for epoch in range(start_epoch, epochs + 1):
+        epoch_start = time.time()
+
+        train_loss, train_acc = run_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            pad_id,
+            train=True,
+            clip_grad=clip_grad,
+            log_every=log_every,
         )
-        val_loss = run_epoch(
-            model, val_loader, optimizer, criterion, device,
-            train=False
+
+        val_loss, val_acc = run_epoch(
+            model,
+            val_loader,
+            optimizer,
+            criterion,
+            device,
+            pad_id,
+            train=False,
+            clip_grad=clip_grad,
+            log_every=log_every,
         )
 
-        elapsed = time.time() - start_time
+        epoch_time = time.time() - epoch_start
 
-        print(f"\nEpoch {epoch} | Time: {elapsed:.2f}s")
-        print(f"  Train Loss: {train_loss:.4f}")
-        print(f"   Val Loss: {val_loss:.4f}")
+        print(f"\nEpoch {epoch} | Time: {epoch_time:.2f}s")
+        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"   Val Loss: {val_loss:.4f} |  Val Acc: {val_acc:.4f}")
 
         scheduler.step(val_loss)
 
-        # Save last checkpoint each epoch
-        save_checkpoint(f"{save_dir}/last.pt", model, optimizer, epoch, val_loss)
+        # Save last always
+        save_checkpoint(last_path, model, optimizer, epoch, best_val_loss)
 
-        # Save best checkpoint when validation improves
-        if val_loss < best_val:
-            best_val = val_loss
-            save_checkpoint(f"{save_dir}/best.pt", model, optimizer, epoch, val_loss)
+        # Save best if improved
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_checkpoint(best_path, model, optimizer, epoch, best_val_loss)
             print("  ✔ Saved new best model")
 
-        # Early stopping check
-        early_stopping(val_loss)
-        if early_stopping.early_stop:
-            print("Early stopping triggered")
-            break
+        print("-" * 60)
+
+    print("Training finished.")
+    print("Best model:", best_path)
+    print("Last checkpoint:", last_path)
