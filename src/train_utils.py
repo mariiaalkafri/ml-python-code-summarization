@@ -1,86 +1,111 @@
 # src/train_utils.py
 import os
 import time
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 
-# -------------------------
-# Metrics
-# -------------------------
-def token_accuracy(logits: torch.Tensor, targets: torch.Tensor, pad_id: int) -> float:
+@dataclass
+class EpochStats:
+    loss: float
+    token_acc: float
+
+
+class EarlyStopping:
     """
-    Token-level accuracy ignoring pad tokens.
-    logits: [B, T, V]
+    Stop if val loss doesn't improve by at least min_delta for `patience` epochs.
+    """
+    def __init__(self, patience: int = 3, min_delta: float = 0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss: Optional[float] = None
+        self.bad_epochs = 0
+
+    def step(self, val_loss: float) -> bool:
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.bad_epochs = 0
+            return False
+
+        improved = (self.best_loss - val_loss) > self.min_delta
+        if improved:
+            self.best_loss = val_loss
+            self.bad_epochs = 0
+        else:
+            self.bad_epochs += 1
+
+        return self.bad_epochs >= self.patience
+
+
+def compute_token_accuracy(logits: torch.Tensor, targets: torch.Tensor, pad_id: int) -> float:
+    """
+    logits:  [B, T, V]
     targets: [B, T]
+    Token accuracy ignoring pad tokens.
     """
-    preds = logits.argmax(dim=-1)  # [B, T]
-    mask = targets != pad_id
-    correct = (preds == targets) & mask
-
-    correct_tokens = correct.sum().item()
-    total_tokens = mask.sum().item()
-
-    if total_tokens == 0:
-        return 0.0
-
-    return correct_tokens / total_tokens
+    with torch.no_grad():
+        preds = logits.argmax(dim=-1)          # [B, T]
+        mask = (targets != pad_id)             # [B, T]
+        correct = ((preds == targets) & mask)  # [B, T]
+        denom = mask.sum().item()
+        if denom == 0:
+            return 0.0
+        return correct.sum().item() / denom
 
 
-# -------------------------
-# Checkpointing
-# -------------------------
-def save_checkpoint(path, model, optimizer, epoch, best_val_loss):
+def save_checkpoint(path: str, model: nn.Module, optimizer: optim.Optimizer, scheduler,
+                    epoch: int, best_val_loss: float):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(
         {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": None if scheduler is None else scheduler.state_dict(),
             "best_val_loss": best_val_loss,
         },
-        path,
+        path
     )
 
 
-def load_checkpoint(path, model, optimizer, device):
+def load_checkpoint(path: str, model: nn.Module, optimizer: optim.Optimizer, scheduler, device: str):
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    start_epoch = ckpt["epoch"] + 1
-    best_val_loss = ckpt.get("best_val_loss", float("inf"))
+    if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    start_epoch = int(ckpt.get("epoch", 0)) + 1
+    best_val_loss = float(ckpt.get("best_val_loss", 1e9))
     return start_epoch, best_val_loss
 
 
-# -------------------------
-# One epoch
-# -------------------------
 def run_epoch(
-    model,
+    model: nn.Module,
     dataloader,
-    optimizer,
-    criterion,
-    device,
-    pad_id,
-    train=True,
-    clip_grad=1.0,
-    log_every=200,
-):
-    if train:
-        model.train()
-    else:
-        model.eval()
+    optimizer: Optional[optim.Optimizer],
+    criterion: nn.Module,
+    device: str,
+    pad_id: int,
+    train: bool,
+    clip_grad: float,
+    log_every: int,
+) -> EpochStats:
+    model.train() if train else model.eval()
 
     total_loss = 0.0
     total_acc = 0.0
-    start_time = time.time()
+    n_batches = len(dataloader)
 
-    for i, batch in enumerate(dataloader):
-        src_ids = batch.src_ids.to(device)
-        src_mask = batch.src_mask.to(device)
-        tgt_ids = batch.tgt_ids.to(device)
+    for step, batch in enumerate(dataloader):
+        src_ids = batch.src_ids.to(device, non_blocking=True)
+        src_mask = batch.src_mask.to(device, non_blocking=True)
+        tgt_ids = batch.tgt_ids.to(device, non_blocking=True)
 
+        # Teacher forcing format
         tgt_in = tgt_ids[:, :-1]
         tgt_out = tgt_ids[:, 1:]
 
@@ -88,47 +113,43 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train):
-            logits = model(src_ids, src_mask, tgt_in)  # [B, T-1, V]
-            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+            logits = model(src_ids, src_mask, tgt_in)   # [B, T, V]
+            vocab_dim = logits.size(-1)
+
+            loss = criterion(logits.reshape(-1, vocab_dim), tgt_out.reshape(-1))
+            acc = compute_token_accuracy(logits, tgt_out, pad_id)
 
             if train:
                 loss.backward()
-                if clip_grad is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
                 optimizer.step()
-
-        acc = token_accuracy(logits, tgt_out, pad_id)
 
         total_loss += loss.item()
         total_acc += acc
 
-        if train and (i % log_every == 0):
-            elapsed = time.time() - start_time
-            print(
-                f"  batch {i}/{len(dataloader)}  "
-                f"loss={loss.item():.4f}  acc={acc:.4f}  time={elapsed:.2f}s"
-            )
+        if step % log_every == 0:
+            print(f"  batch {step}/{n_batches}  loss={loss.item():.4f}  tok_acc={acc*100:.2f}%")
 
-    return total_loss / max(1, len(dataloader)), total_acc / max(1, len(dataloader))
+    return EpochStats(loss=total_loss / n_batches, token_acc=total_acc / n_batches)
 
 
-# -------------------------
-# Full training
-# -------------------------
 def train_model(
-    model,
+    model: nn.Module,
     train_loader,
     val_loader,
-    device,
-    pad_id,
-    epochs=10,
-    lr=3e-4,
-    weight_decay=0.01,
-    clip_grad=1.0,
-    log_every=200,
-    save_dir="models",
-    resume=True,
+    device: str,
+    pad_id: int,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    clip_grad: float,
+    save_dir: str,
+    log_every: int,
+    patience: int,
+    min_delta: float,
+    resume: bool = False,
 ):
+    os.makedirs(save_dir, exist_ok=True)
     best_path = os.path.join(save_dir, "best.pt")
     last_path = os.path.join(save_dir, "last.pt")
 
@@ -139,65 +160,68 @@ def train_model(
     )
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+    early = EarlyStopping(patience=patience, min_delta=min_delta)
 
     start_epoch = 1
-    best_val_loss = float("inf")
+    best_val_loss = 1e9
 
-    # Resume if last checkpoint exists
+    # Resume if requested and last exists
     if resume and os.path.exists(last_path):
-        try:
-            print(f"Found checkpoint {last_path} — resuming...")
-            start_epoch, best_val_loss = load_checkpoint(last_path, model, optimizer, device)
-            print(f"Resumed from epoch {start_epoch} | best_val_loss={best_val_loss:.4f}")
-        except Exception as e:
-            print("Could not resume, starting fresh. Reason:", e)
+        print(f"Resuming from: {last_path}")
+        start_epoch, best_val_loss = load_checkpoint(last_path, model, optimizer, scheduler, device)
+        early.best_loss = best_val_loss
+        print(f"Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
 
     for epoch in range(start_epoch, epochs + 1):
-        epoch_start = time.time()
+        t0 = time.time()
 
-        train_loss, train_acc = run_epoch(
-            model,
-            train_loader,
-            optimizer,
-            criterion,
-            device,
-            pad_id,
+        train_stats = run_epoch(
+            model=model,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            pad_id=pad_id,
             train=True,
             clip_grad=clip_grad,
             log_every=log_every,
         )
 
-        val_loss, val_acc = run_epoch(
-            model,
-            val_loader,
-            optimizer,
-            criterion,
-            device,
-            pad_id,
+        val_stats = run_epoch(
+            model=model,
+            dataloader=val_loader,
+            optimizer=None,
+            criterion=criterion,
+            device=device,
+            pad_id=pad_id,
             train=False,
             clip_grad=clip_grad,
-            log_every=log_every,
+            log_every=max(1, log_every),
         )
 
-        epoch_time = time.time() - epoch_start
+        dt = time.time() - t0
+        print(f"\nEpoch {epoch} | Time: {dt:.2f}s")
+        print(f"  Train Loss: {train_stats.loss:.4f} | Train TokAcc: {train_stats.token_acc*100:.2f}%")
+        print(f"    Val Loss: {val_stats.loss:.4f} |   Val TokAcc: {val_stats.token_acc*100:.2f}%")
 
-        print(f"\nEpoch {epoch} | Time: {epoch_time:.2f}s")
-        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-        print(f"   Val Loss: {val_loss:.4f} |  Val Acc: {val_acc:.4f}")
+        scheduler.step(val_stats.loss)
 
-        scheduler.step(val_loss)
-
-        # Save last always
-        save_checkpoint(last_path, model, optimizer, epoch, best_val_loss)
+        # Always save last
+        save_checkpoint(last_path, model, optimizer, scheduler, epoch, best_val_loss)
 
         # Save best if improved
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_checkpoint(best_path, model, optimizer, epoch, best_val_loss)
+        if val_stats.loss < best_val_loss:
+            best_val_loss = val_stats.loss
+            save_checkpoint(best_path, model, optimizer, scheduler, epoch, best_val_loss)
             print("  ✔ Saved new best model")
+
+        # Early stopping
+        if early.step(val_stats.loss):
+            print("  ⛔ Early stopping triggered")
+            break
 
         print("-" * 60)
 
     print("Training finished.")
-    print("Best model:", best_path)
+    print("Best checkpoint:", best_path)
     print("Last checkpoint:", last_path)
