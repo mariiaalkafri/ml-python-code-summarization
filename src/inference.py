@@ -17,22 +17,21 @@ def load_inference_model(model_path: str, tokenizer_path: str, device: str):
     if pad_id is None:
         raise ValueError("Tokenizer missing <pad> token")
 
-    # MUST match training hyperparams
     model = Seq2SeqLSTMAttn(
         vocab_size=vocab_size,
         emb_dim=256,
         enc_hidden=256,
         dec_hidden=512,
         num_layers=1,
-        dropout=0.0,  # eval
+        dropout=0.0,
         pad_id=pad_id,
     ).to(device)
 
     ckpt = torch.load(model_path, map_location=device)
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
     else:
-        model.load_state_dict(ckpt)
+        model.load_state_dict(ckpt, strict=True)
 
     model.eval()
     return model, tokenizer
@@ -59,12 +58,12 @@ def summarize_code(
     enc = tokenizer.encode(code)
     ids = enc.ids[:max_src_len]
 
-    # pad + mask
     length = len(ids)
     if length < max_src_len:
         ids = ids + [pad_id] * (max_src_len - length)
-    src_ids = torch.tensor([ids], dtype=torch.long, device=device)  # [1,S]
-    src_mask = (src_ids != pad_id).long()  # [1,S]
+
+    src_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    src_mask = (src_ids != pad_id).long()
 
     with torch.no_grad():
         sequences = model.generate(
@@ -77,12 +76,13 @@ def summarize_code(
             repetition_penalty=1.15,
         )
 
-    # sequences[0] includes BOS and generated tokens
     gen_ids = sequences[0]
 
-    # remove BOS, cut at EOS
-    if len(gen_ids) > 0 and gen_ids[0] == bos_id:
+    # remove BOS
+    if gen_ids and gen_ids[0] == bos_id:
         gen_ids = gen_ids[1:]
+
+    # cut at EOS
     if eos_id in gen_ids:
         gen_ids = gen_ids[:gen_ids.index(eos_id)]
 
