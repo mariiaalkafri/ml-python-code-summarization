@@ -29,7 +29,9 @@ def pick_2d_stratified_subset(
     code_buckets: int = 5,
     sum_buckets: int = 3,
 ) -> Tuple[List[Dict], List[Tuple[Tuple[int, int], int, int]]]:
-
+    """
+    Select a subset that is stratified across code-length and summary-length buckets.
+    """
     if n is None or n >= len(examples):
         return examples, []
 
@@ -86,11 +88,18 @@ def pick_2d_stratified_subset(
 
 
 def main():
+    # -------------------------
+    # Paths
+    # -------------------------
     tokenizer_path = "data/tokenizer/tokenizer.json"
-    train_path = "data/processed/train.jsonl"
-    val_path = "data/processed/valid.jsonl"
 
-    # Hyperparams (same as before)
+    # ✅ FINAL DATASETS (sanitized + mixed 70 strong / 30 light)
+    train_path = "data/processed/train_mix_70strong_30light_final_sanitized.jsonl"
+    val_path = "data/processed/valid_mix_70strong_30light_final_sanitized.jsonl"
+
+    # -------------------------
+    # Hyperparams
+    # -------------------------
     batch_size = 32
     max_src_len = 256
     max_tgt_len = 64
@@ -99,35 +108,47 @@ def main():
     clip_grad = 1.0
     log_every = 200
 
-    # Train MORE: previously 10, now total 20 (=> continues 11..20)
-    epochs_total = 20
+    # ✅ Fine-tune for fewer epochs (early stopping will handle the rest)
+    epochs_total = 5
 
-    # Subset
-    SUBSET_TRAIN = 50_000
-    SUBSET_VAL = 5_000
+    # ✅ Subset (increase since dataset is now cleaner and larger)
+    # If you want full dataset, set SUBSET_TRAIN=None and SUBSET_VAL=None
+    SUBSET_TRAIN = 120_000
+    SUBSET_VAL = 10_000
     SEED = 42
 
-    # ✅ Resume + Save
-    RESUME_PATH = "/content/drive/MyDrive/ml-python-code-summarization/models/last.pt"
-    SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_run2"
+    # ✅ Resume from BEST previous checkpoint (not last)
+    RESUME_PATH = "/content/drive/MyDrive/ml-python-code-summarization/models/best.pt"
+    SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_finaldata"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    print(f"Train file: {train_path}")
+    print(f"Val file:   {val_path}")
     print(f"Resume: {RESUME_PATH}")
     print(f"Save dir: {SAVE_DIR}")
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
+    # -------------------------
+    # Tokenizer / Collator
+    # -------------------------
     collator = Collator(tokenizer_path, max_src_len=max_src_len, max_tgt_len=max_tgt_len)
     pad_id = collator.pad_id
     vocab_size = collator.tokenizer.get_vocab_size()
 
+    # -------------------------
+    # Load datasets
+    # -------------------------
     print("Loading datasets...")
     train_dataset = JsonlCodeSummaryDataset(train_path)
     val_dataset = JsonlCodeSummaryDataset(val_path)
     print(f"Full train examples: {len(train_dataset)}")
-    print(f"Full val examples: {len(val_dataset)}")
+    print(f"Full val examples:   {len(val_dataset)}")
 
+    # -------------------------
+    # Subset selection (2D stratified)
+    # -------------------------
     train_subset, train_report = pick_2d_stratified_subset(train_dataset.examples, SUBSET_TRAIN, seed=SEED)
     val_subset, _ = pick_2d_stratified_subset(val_dataset.examples, SUBSET_VAL, seed=SEED)
 
@@ -143,6 +164,9 @@ def main():
 
     print(f"Hyperparams -> batch={batch_size} src_len={max_src_len} tgt_len={max_tgt_len} epochs_total={epochs_total} lr={lr}")
 
+    # -------------------------
+    # Dataloaders
+    # -------------------------
     print("Building dataloaders...")
     train_loader = DataLoader(
         train_dataset,
@@ -162,8 +186,11 @@ def main():
     )
 
     print(f"Train batches/epoch: {len(train_loader)}")
-    print(f"Val batches/epoch: {len(val_loader)}")
+    print(f"Val batches/epoch:   {len(val_loader)}")
 
+    # -------------------------
+    # Model
+    # -------------------------
     print("Initializing model...")
     model = Seq2SeqLSTMAttn(
         vocab_size=vocab_size,
@@ -175,7 +202,10 @@ def main():
         pad_id=pad_id
     ).to(device)
 
-    print("Starting (resumed) training...")
+    # -------------------------
+    # Train
+    # -------------------------
+    print("Starting training (fine-tuning from resume checkpoint if found)...")
     train_model(
         model=model,
         train_loader=train_loader,
