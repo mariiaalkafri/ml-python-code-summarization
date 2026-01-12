@@ -30,11 +30,20 @@ def generate_summary():
                 if line.strip() == "":
                     break
                 lines.append(line)
+
             code = "\n".join(lines).strip()
             if not code:
                 continue
 
-            summary = summarize_code(model, tokenizer, code, device, max_src_len=256, max_gen_len=64)
+            summary = summarize_code(
+                model=model,
+                tokenizer=tokenizer,
+                code=code,
+                device=device,
+                max_src_len=256,
+                max_gen_len=64,
+            )
+
             print("\nGenerated Summary:")
             print(summary)
             print("-" * 60)
