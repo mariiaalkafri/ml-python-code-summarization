@@ -109,7 +109,7 @@ def main():
     log_every = 200
 
     # ✅ Fine-tune for fewer epochs (early stopping will handle the rest)
-    epochs_total = 5
+    epochs_total = 10
 
     # ✅ Subset (increase since dataset is now cleaner and larger)
     # If you want full dataset, set SUBSET_TRAIN=None and SUBSET_VAL=None
@@ -118,8 +118,8 @@ def main():
     SEED = 42
 
     # ✅ Resume from BEST previous checkpoint (not last)
-    RESUME_PATH = "/content/drive/MyDrive/ml-python-code-summarization/models/best.pt"
-    SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_finaldata"
+    RESUME_PATH = "/content/drive/MyDrive/ml-python-code-summarization/models_run2/best.pt"
+    SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_run2_finaldata"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
