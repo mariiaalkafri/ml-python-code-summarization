@@ -8,7 +8,6 @@ from src.inference import load_inference_model, summarize_code
 
 
 def generate_summary():
-    # ✅ Put your Drive model path here:
     model_path = "/content/drive/MyDrive/ml-python-code-summarization/models/best.pt"
     tokenizer_path = "data/tokenizer/tokenizer.json"
 
