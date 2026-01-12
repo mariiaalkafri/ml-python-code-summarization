@@ -1,226 +1,153 @@
-import sys
 import os
-import random
-from typing import List, Dict, Tuple
-
+import time
 import torch
-from torch.utils.data import DataLoader
-
-sys.path.append(os.path.abspath("."))
-
-from src.data import JsonlCodeSummaryDataset, Collator
-from src.model import Seq2SeqLSTMAttn
-from src.train_utils import train_model
+import torch.nn as nn
+import torch.optim as optim
 
 
-def _bucket_index(value: int, boundaries: List[int]) -> int:
-    for i, b in enumerate(boundaries):
-        if value <= b:
-            return i
-    return len(boundaries)
+class EarlyStopping:
+    def __init__(self, patience=4, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
 
+    def __call__(self, val_loss: float):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.counter = 0
+            return
 
-def pick_2d_stratified_subset(
-    examples: List[Dict],
-    n: int,
-    seed: int = 42,
-    code_boundaries: List[int] = None,
-    sum_boundaries: List[int] = None,
-    code_buckets: int = 5,
-    sum_buckets: int = 3,
-) -> Tuple[List[Dict], List[Tuple[Tuple[int, int], int, int]]]:
-    """
-    Select a subset that is stratified across code-length and summary-length buckets.
-    """
-    if n is None or n >= len(examples):
-        return examples, []
-
-    rng = random.Random(seed)
-
-    if code_boundaries is None:
-        code_boundaries = [200, 600, 1200, 2400]  # 5 buckets
-    if sum_boundaries is None:
-        sum_boundaries = [40, 90]  # 3 buckets
-
-    cells = {(i, j): [] for i in range(code_buckets) for j in range(sum_buckets)}
-
-    for ex in examples:
-        code_len = len(ex.get("code", ""))
-        sum_len = len(ex.get("summary", ""))
-        cb = min(_bucket_index(code_len, code_boundaries), code_buckets - 1)
-        sb = min(_bucket_index(sum_len, sum_boundaries), sum_buckets - 1)
-        cells[(cb, sb)].append(ex)
-
-    total = len(examples)
-    quotas = {k: int(round(n * (len(v) / total))) for k, v in cells.items()}
-
-    qsum = sum(quotas.values())
-    if qsum != n:
-        keys_sorted = sorted(cells.keys(), key=lambda k: len(cells[k]), reverse=True)
-        diff = n - qsum
-        idx = 0
-        while diff != 0 and idx < len(keys_sorted) * 10:
-            k = keys_sorted[idx % len(keys_sorted)]
-            if diff > 0:
-                quotas[k] += 1
-                diff -= 1
-            else:
-                if quotas[k] > 0:
-                    quotas[k] -= 1
-                    diff += 1
-            idx += 1
-
-    subset = []
-    report = []
-    for cell_key, cell_list in cells.items():
-        q = quotas[cell_key]
-        report.append((cell_key, len(cell_list), q))
-        if q <= 0:
-            continue
-        if q >= len(cell_list):
-            subset.extend(cell_list)
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
         else:
-            subset.extend(rng.sample(cell_list, q))
-
-    rng.shuffle(subset)
-    subset = subset[:n]
-    return subset, report
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
 
 
-def main():
-    # -------------------------
-    # Paths
-    # -------------------------
-    tokenizer_path = "data/tokenizer/tokenizer.json"
+def save_checkpoint(path, model, optimizer, epoch, val_loss, best_val):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    state = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_loss": val_loss,
+        "best_val": best_val,
+    }
+    torch.save(state, path)
 
-    # ✅ FINAL DATASETS (sanitized + mixed 70 strong / 30 light)
-    train_path = "data/processed/train_mix_70strong_30light_final_sanitized.jsonl"
-    val_path = "data/processed/valid_mix_70strong_30light_final_sanitized.jsonl"
 
-    # -------------------------
-    # Hyperparams
-    # -------------------------
-    batch_size = 32
-    max_src_len = 256
-    max_tgt_len = 64
-    lr = 3e-4
-    weight_decay = 0.01
-    clip_grad = 1.0
-    log_every = 200
+def run_epoch(
+    model, dataloader, optimizer, criterion, device,
+    train=True, clip_grad=1.0, log_every=200, pad_id=0
+):
+    model.train() if train else model.eval()
 
-    # ✅ Fine-tune for fewer epochs (early stopping will handle the rest)
-    epochs_total = 5
+    total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
 
-    # ✅ Subset (increase since dataset is now cleaner and larger)
-    # If you want full dataset, set SUBSET_TRAIN=None and SUBSET_VAL=None
-    SUBSET_TRAIN = 120_000
-    SUBSET_VAL = 10_000
-    SEED = 42
+    start = time.time()
 
-    # ✅ Resume from BEST previous checkpoint (not last)
-    RESUME_PATH = "/content/drive/MyDrive/ml-python-code-summarization/models/best.pt"
-    SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_finaldata"
+    for i, batch in enumerate(dataloader):
+        src_ids = batch.src_ids.to(device, non_blocking=True)
+        src_mask = batch.src_mask.to(device, non_blocking=True)
+        tgt_ids = batch.tgt_ids.to(device, non_blocking=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    print(f"Train file: {train_path}")
-    print(f"Val file:   {val_path}")
-    print(f"Resume: {RESUME_PATH}")
-    print(f"Save dir: {SAVE_DIR}")
+        tgt_in = tgt_ids[:, :-1]
+        tgt_out = tgt_ids[:, 1:]
 
-    os.makedirs(SAVE_DIR, exist_ok=True)
+        if train:
+            optimizer.zero_grad()
+            logits = model(src_ids, src_mask, tgt_in)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            optimizer.step()
+        else:
+            with torch.no_grad():
+                logits = model(src_ids, src_mask, tgt_in)
+                loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
 
-    # -------------------------
-    # Tokenizer / Collator
-    # -------------------------
-    collator = Collator(tokenizer_path, max_src_len=max_src_len, max_tgt_len=max_tgt_len)
-    pad_id = collator.pad_id
-    vocab_size = collator.tokenizer.get_vocab_size()
+        total_loss += loss.item()
 
-    # -------------------------
-    # Load datasets
-    # -------------------------
-    print("Loading datasets...")
-    train_dataset = JsonlCodeSummaryDataset(train_path)
-    val_dataset = JsonlCodeSummaryDataset(val_path)
-    print(f"Full train examples: {len(train_dataset)}")
-    print(f"Full val examples:   {len(val_dataset)}")
+        with torch.no_grad():
+            preds = logits.argmax(dim=-1)
+            mask = tgt_out.ne(pad_id)
+            total_correct += (preds.eq(tgt_out) & mask).sum().item()
+            total_tokens += mask.sum().item()
 
-    # -------------------------
-    # Subset selection (2D stratified)
-    # -------------------------
-    train_subset, train_report = pick_2d_stratified_subset(train_dataset.examples, SUBSET_TRAIN, seed=SEED)
-    val_subset, _ = pick_2d_stratified_subset(val_dataset.examples, SUBSET_VAL, seed=SEED)
+        if train and (i % log_every == 0):
+            acc = 0.0 if total_tokens == 0 else (total_correct / total_tokens) * 100.0
+            elapsed = time.time() - start
+            print(f"  batch {i}/{len(dataloader)}  loss={loss.item():.4f}  acc={acc:.2f}%  time={elapsed:.2f}s")
 
-    train_dataset.examples = train_subset
-    val_dataset.examples = val_subset
+    avg_loss = total_loss / max(1, len(dataloader))
+    avg_acc = 0.0 if total_tokens == 0 else (total_correct / total_tokens) * 100.0
+    return avg_loss, avg_acc
 
-    print(f"Subset selected -> train={len(train_dataset)}  val={len(val_dataset)}")
-    if train_report:
-        print("Bucket report: (code_bucket, sum_bucket)  total_in_cell  quota")
-        for cell, total_in_cell, quota in train_report:
-            if quota > 0:
-                print(f"  {cell}  total={total_in_cell}  quota={quota}")
 
-    print(f"Hyperparams -> batch={batch_size} src_len={max_src_len} tgt_len={max_tgt_len} epochs_total={epochs_total} lr={lr}")
-
-    # -------------------------
-    # Dataloaders
-    # -------------------------
-    print("Building dataloaders...")
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collator,
-        num_workers=2,
-        pin_memory=True
+def train_model(
+    model, train_loader, val_loader, device, pad_id,
+    epochs_total=10, lr=3e-4, weight_decay=0.01,
+    save_dir="models", log_every=200, clip_grad=1.0,
+    resume_path=None
+):
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=1, min_lr=1e-6
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collator,
-        num_workers=2,
-        pin_memory=True
-    )
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+    early_stopping = EarlyStopping(patience=4, min_delta=0.001)
 
-    print(f"Train batches/epoch: {len(train_loader)}")
-    print(f"Val batches/epoch:   {len(val_loader)}")
+    os.makedirs(save_dir, exist_ok=True)
 
-    # -------------------------
-    # Model
-    # -------------------------
-    print("Initializing model...")
-    model = Seq2SeqLSTMAttn(
-        vocab_size=vocab_size,
-        emb_dim=256,
-        enc_hidden=256,
-        dec_hidden=512,
-        num_layers=1,
-        dropout=0.2,
-        pad_id=pad_id
-    ).to(device)
+    start_epoch = 1
+    best_val = float("inf")
 
-    # -------------------------
-    # Train
-    # -------------------------
-    print("Starting training (fine-tuning from resume checkpoint if found)...")
-    train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=device,
-        pad_id=pad_id,
-        epochs_total=epochs_total,
-        lr=lr,
-        weight_decay=weight_decay,
-        save_dir=SAVE_DIR,
-        resume_path=RESUME_PATH,
-        log_every=log_every,
-        clip_grad=clip_grad
-    )
+    # ✅ RESUME
+    if resume_path is not None and os.path.exists(resume_path):
+        print(f"Resuming from checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
+        print(f"Checkpoint loaded. Last completed epoch: {start_epoch-1}. Best val so far: {best_val:.4f}")
+    elif resume_path is not None:
+        print(f"Resume checkpoint not found at: {resume_path} (starting fresh)")
 
+    for epoch in range(start_epoch, epochs_total + 1):
+        start_time = time.time()
 
-if __name__ == "__main__":
-    main()
+        train_loss, train_acc = run_epoch(
+            model, train_loader, optimizer, criterion, device,
+            train=True, clip_grad=clip_grad, log_every=log_every, pad_id=pad_id
+        )
+        val_loss, val_acc = run_epoch(
+            model, val_loader, optimizer, criterion, device,
+            train=False, pad_id=pad_id
+        )
+
+        elapsed = time.time() - start_time
+        print(f"\nEpoch {epoch} | Time: {elapsed:.2f}s")
+        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+        print(f"   Val Loss: {val_loss:.4f} |   Val Acc: {val_acc:.2f}%")
+
+        scheduler.step(val_loss)
+
+        # ✅ Update best first, then save checkpoints cleanly
+        if val_loss < best_val:
+            best_val = val_loss
+            save_checkpoint(f"{save_dir}/best.pt", model, optimizer, epoch, val_loss, best_val)
+            print("  ✔ Saved new best model")
+
+        save_checkpoint(f"{save_dir}/last.pt", model, optimizer, epoch, val_loss, best_val)
+
+        early_stopping(val_loss)
+        if early_stopping.early_stop:
+            print("Early stopping triggered")
+            break
