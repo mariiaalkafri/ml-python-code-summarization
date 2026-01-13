@@ -120,7 +120,7 @@ def train_model(
         optimizer, mode="min", factor=0.5, patience=1, min_lr=1e-6
     )
 
-    # ✅ SAFE IMPROVEMENT: label smoothing
+    # ✅ safe improvement
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id, label_smoothing=0.1)
 
     early_stopping = EarlyStopping(patience=4, min_delta=0.001)
@@ -170,13 +170,11 @@ def train_model(
 
         scheduler.step(val_loss)
 
-        # Save best
         if val_loss < best_val:
             best_val = val_loss
             save_checkpoint(f"{save_dir}/best.pt", model, optimizer, epoch, val_loss, best_val)
             print("  ✔ Saved new best model")
 
-        # Save last
         save_checkpoint(f"{save_dir}/last.pt", model, optimizer, epoch, val_loss, best_val)
 
         early_stopping(val_loss)
