@@ -1,5 +1,5 @@
-import sys
 import os
+import sys
 import random
 from typing import List, Dict, Tuple
 
@@ -29,9 +29,6 @@ def pick_2d_stratified_subset(
     code_buckets: int = 5,
     sum_buckets: int = 3,
 ) -> Tuple[List[Dict], List[Tuple[Tuple[int, int], int, int]]]:
-    """
-    Select a subset that is stratified across code-length and summary-length buckets.
-    """
     if n is None or n >= len(examples):
         return examples, []
 
@@ -71,10 +68,8 @@ def pick_2d_stratified_subset(
             idx += 1
 
     subset = []
-    report = []
     for cell_key, cell_list in cells.items():
         q = quotas[cell_key]
-        report.append((cell_key, len(cell_list), q))
         if q <= 0:
             continue
         if q >= len(cell_list):
@@ -84,22 +79,15 @@ def pick_2d_stratified_subset(
 
     rng.shuffle(subset)
     subset = subset[:n]
-    return subset, report
+    return subset, []
 
 
 def main():
-    # -------------------------
-    # Paths
-    # -------------------------
     tokenizer_path = "data/tokenizer/tokenizer.json"
-
-    # ✅ FINAL DATASETS (sanitized + mixed 70 strong / 30 light)
     train_path = "data/processed/train_mix_70strong_30light_final_sanitized.jsonl"
     val_path = "data/processed/valid_mix_70strong_30light_final_sanitized.jsonl"
 
-    # -------------------------
     # Hyperparams
-    # -------------------------
     batch_size = 32
     max_src_len = 256
     max_tgt_len = 64
@@ -108,18 +96,15 @@ def main():
     clip_grad = 1.0
     log_every = 200
 
-    # ✅ Fine-tune for fewer epochs (early stopping will handle the rest)
-    epochs_total = 20
-
-    # ✅ Subset (increase since dataset is now cleaner and larger)
-    # If you want full dataset, set SUBSET_TRAIN=None and SUBSET_VAL=None
-    SUBSET_TRAIN = 120_000
-    SUBSET_VAL = 10_000
+    # FROM SCRATCH
+    epochs_total = 25
+    SUBSET_TRAIN = 50_000
+    SUBSET_VAL = 8_000
     SEED = 42
 
-    # ✅ Resume from BEST previous checkpoint (not last)
-    RESUME_PATH = "/content/drive/MyDrive/ml-python-code-summarization/models_run2/best.pt"
-    SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_run2_finaldata"
+    # ✅ Start fresh
+    RESUME_PATH = None
+    SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_fromscratch_clean50k"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -130,43 +115,22 @@ def main():
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
-    # -------------------------
-    # Tokenizer / Collator
-    # -------------------------
     collator = Collator(tokenizer_path, max_src_len=max_src_len, max_tgt_len=max_tgt_len)
     pad_id = collator.pad_id
     vocab_size = collator.tokenizer.get_vocab_size()
 
-    # -------------------------
-    # Load datasets
-    # -------------------------
     print("Loading datasets...")
     train_dataset = JsonlCodeSummaryDataset(train_path)
     val_dataset = JsonlCodeSummaryDataset(val_path)
     print(f"Full train examples: {len(train_dataset)}")
     print(f"Full val examples:   {len(val_dataset)}")
 
-    # -------------------------
-    # Subset selection (2D stratified)
-    # -------------------------
-    train_subset, train_report = pick_2d_stratified_subset(train_dataset.examples, SUBSET_TRAIN, seed=SEED)
+    train_subset, _ = pick_2d_stratified_subset(train_dataset.examples, SUBSET_TRAIN, seed=SEED)
     val_subset, _ = pick_2d_stratified_subset(val_dataset.examples, SUBSET_VAL, seed=SEED)
-
     train_dataset.examples = train_subset
     val_dataset.examples = val_subset
-
     print(f"Subset selected -> train={len(train_dataset)}  val={len(val_dataset)}")
-    if train_report:
-        print("Bucket report: (code_bucket, sum_bucket)  total_in_cell  quota")
-        for cell, total_in_cell, quota in train_report:
-            if quota > 0:
-                print(f"  {cell}  total={total_in_cell}  quota={quota}")
 
-    print(f"Hyperparams -> batch={batch_size} src_len={max_src_len} tgt_len={max_tgt_len} epochs_total={epochs_total} lr={lr}")
-
-    # -------------------------
-    # Dataloaders
-    # -------------------------
     print("Building dataloaders...")
     train_loader = DataLoader(
         train_dataset,
@@ -185,12 +149,6 @@ def main():
         pin_memory=True
     )
 
-    print(f"Train batches/epoch: {len(train_loader)}")
-    print(f"Val batches/epoch:   {len(val_loader)}")
-
-    # -------------------------
-    # Model
-    # -------------------------
     print("Initializing model...")
     model = Seq2SeqLSTMAttn(
         vocab_size=vocab_size,
@@ -202,10 +160,7 @@ def main():
         pad_id=pad_id
     ).to(device)
 
-    # -------------------------
-    # Train
-    # -------------------------
-    print("Starting training (fine-tuning from resume checkpoint if found)...")
+    print("Starting training FROM SCRATCH...")
     train_model(
         model=model,
         train_loader=train_loader,
