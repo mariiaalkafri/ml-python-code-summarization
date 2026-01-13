@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+
 class EarlyStopping:
     def __init__(self, patience=4, min_delta=0.001):
         self.patience = patience
@@ -26,168 +27,152 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop = True
 
-def save_checkpoint(path, model, optimizer, epoch, val_loss):
+
+def save_checkpoint(path, model, optimizer, epoch, val_loss, best_val):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     state = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "val_loss": val_loss,
+        "best_val": best_val,
     }
     torch.save(state, path)
 
-def generate_square_subsequent_mask(sz, device):
-    mask = (torch.triu(torch.ones((sz, sz), device=device)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-    return mask
 
-@torch.no_grad()
-def token_accuracy(logits: torch.Tensor, targets: torch.Tensor, pad_id: int) -> float:
-    preds = logits.argmax(dim=-1)
-    mask = targets.ne(pad_id)
-    correct = (preds.eq(targets) & mask).sum().item()
-    total = mask.sum().item()
-    return correct / max(1, total)
-
-def run_epoch_transformer(
-    model,
-    dataloader,
-    optimizer,
-    criterion,
-    device,
-    pad_id,
-    train=True,
-    clip_grad=1.0,
-    log_every=200,
+def run_epoch(
+    model, dataloader, optimizer, criterion, device,
+    train=True, clip_grad=1.0, log_every=200, pad_id=0,
+    scaler=None
 ):
-    if train:
-        model.train()
-    else:
-        model.eval()
+    model.train() if train else model.eval()
 
     total_loss = 0.0
-    total_acc = 0.0
-    n_steps = 0
+    total_correct = 0
+    total_tokens = 0
+
+    start = time.time()
+    use_amp = (scaler is not None) and device.startswith("cuda")
 
     for i, batch in enumerate(dataloader):
         src_ids = batch.src_ids.to(device, non_blocking=True)
         src_mask = batch.src_mask.to(device, non_blocking=True)
         tgt_ids = batch.tgt_ids.to(device, non_blocking=True)
 
-        # Create masks
-        src_key_padding_mask = (src_mask == 0)
-        
-        tgt_input = tgt_ids[:, :-1]
-        tgt_target = tgt_ids[:, 1:]
-        
-        tgt_key_padding_mask = (tgt_input == pad_id)
-        
-        tgt_seq_len = tgt_input.size(1)
-        tgt_mask = generate_square_subsequent_mask(tgt_seq_len, device)
+        tgt_in = tgt_ids[:, :-1]
+        tgt_out = tgt_ids[:, 1:]
 
         if train:
             optimizer.zero_grad()
 
-        outputs = model(
-            src_ids=src_ids, 
-            tgt_ids=tgt_input, 
-            src_key_padding_mask=src_key_padding_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            tgt_mask=tgt_mask
-        )
+            if use_amp:
+                with torch.amp.autocast("cuda"):
+                    logits = model(src_ids, src_mask, tgt_in)
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
 
-        logits = outputs # [B, T, V]
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(src_ids, src_mask, tgt_in)
+                loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                optimizer.step()
 
-        loss = criterion(
-            logits.reshape(-1, logits.size(-1)),
-            tgt_target.reshape(-1),
-        )
-
-        if train:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-            optimizer.step()
-
-        with torch.no_grad():
-            acc = token_accuracy(logits, tgt_target, pad_id)
+        else:
+            with torch.no_grad():
+                if use_amp:
+                    with torch.amp.autocast("cuda"):
+                        logits = model(src_ids, src_mask, tgt_in)
+                        loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+                else:
+                    logits = model(src_ids, src_mask, tgt_in)
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
 
         total_loss += loss.item()
-        total_acc += acc
-        n_steps += 1
+
+        with torch.no_grad():
+            preds = logits.argmax(dim=-1)
+            mask = tgt_out.ne(pad_id)
+            total_correct += (preds.eq(tgt_out) & mask).sum().item()
+            total_tokens += mask.sum().item()
 
         if train and (i % log_every == 0):
-            print(f"  batch {i}/{len(dataloader)}  loss={loss.item():.4f}  acc={acc*100:.2f}%")
+            acc = 0.0 if total_tokens == 0 else (total_correct / total_tokens) * 100.0
+            elapsed = time.time() - start
+            print(f"  batch {i}/{len(dataloader)}  loss={loss.item():.4f}  acc={acc:.2f}%  time={elapsed:.2f}s")
 
-    return (total_loss / max(1, n_steps)), (total_acc / max(1, n_steps))
+    avg_loss = total_loss / max(1, len(dataloader))
+    avg_acc = 0.0 if total_tokens == 0 else (total_correct / total_tokens) * 100.0
+    return avg_loss, avg_acc
 
-def train_transformer_model(
-    model,
-    train_loader,
-    val_loader,
-    device,
-    pad_id,
-    epochs=10,
-    lr=3e-4,
-    weight_decay=0.01,
-    save_dir="models_transformer",
-    log_every=200,
-    clip_grad=1.0,
+
+def train_model(
+    model, train_loader, val_loader, device, pad_id,
+    epochs_total=10, lr=3e-4, weight_decay=0.01,
+    save_dir="models", log_every=200, clip_grad=1.0,
+    resume_path=None
 ):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    
-    # Optional: Scheduler with warmup could be added here, but sticking to basic ReduceLROnPlateau for consistency
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=1, min_lr=1e-6
     )
-    
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
-
     early_stopping = EarlyStopping(patience=4, min_delta=0.001)
-    best_val = float("inf")
 
     os.makedirs(save_dir, exist_ok=True)
 
-    for epoch in range(1, epochs + 1):
+    start_epoch = 1
+    best_val = float("inf")
+
+    scaler = torch.amp.GradScaler("cuda", enabled=device.startswith("cuda"))
+
+    if resume_path is not None and os.path.exists(resume_path):
+        print(f"Resuming from checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
+        print(f"Checkpoint loaded. Last completed epoch: {start_epoch-1}. Best val so far: {best_val:.4f}")
+    elif resume_path is not None:
+        print(f"Resume checkpoint not found at: {resume_path} (starting fresh)")
+
+    print(f"Will train from epoch {start_epoch} to {epochs_total}")
+    if start_epoch > epochs_total:
+        print("Nothing to do: start_epoch > epochs_total.")
+        return
+
+    for epoch in range(start_epoch, epochs_total + 1):
         start_time = time.time()
 
-        train_loss, train_acc = run_epoch_transformer(
-            model=model,
-            dataloader=train_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            device=device,
-            pad_id=pad_id,
-            train=True,
-            clip_grad=clip_grad,
-            log_every=log_every,
+        train_loss, train_acc = run_epoch(
+            model, train_loader, optimizer, criterion, device,
+            train=True, clip_grad=clip_grad, log_every=log_every, pad_id=pad_id,
+            scaler=scaler
         )
-
-        val_loss, val_acc = run_epoch_transformer(
-            model=model,
-            dataloader=val_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            device=device,
-            pad_id=pad_id,
-            train=False,
+        val_loss, val_acc = run_epoch(
+            model, val_loader, optimizer, criterion, device,
+            train=False, pad_id=pad_id,
+            scaler=scaler
         )
 
         elapsed = time.time() - start_time
 
         print(f"\nEpoch {epoch} | Time: {elapsed:.2f}s")
-        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}%")
-        print(f"   Val Loss: {val_loss:.4f} |   Val Acc: {val_acc*100:.2f}%")
+        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+        print(f"   Val Loss: {val_loss:.4f} |   Val Acc: {val_acc:.2f}%")
 
         scheduler.step(val_loss)
 
-        # Save last
-        save_checkpoint(os.path.join(save_dir, "last_transformer.pt"), model, optimizer, epoch, val_loss)
-
-        # Save best
         if val_loss < best_val:
             best_val = val_loss
-            save_checkpoint(os.path.join(save_dir, "best_transformer.pt"), model, optimizer, epoch, val_loss)
-            print("  ✔ Saved new best transformer model")
+            save_checkpoint(f"{save_dir}/best.pt", model, optimizer, epoch, val_loss, best_val)
+            print("  ✔ Saved new best model")
+
+        save_checkpoint(f"{save_dir}/last.pt", model, optimizer, epoch, val_loss, best_val)
 
         early_stopping(val_loss)
         if early_stopping.early_stop:
