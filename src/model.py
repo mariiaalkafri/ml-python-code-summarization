@@ -10,7 +10,7 @@ class LuongAttention(nn.Module):
         self.project = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, hidden, encoder_outputs, src_mask=None):
-        # hidden: [B, 1, H]
+        # hidden: [B, 1, H] (decoder output at time t)
         # encoder_outputs: [B, S, H]
 
         if hidden.dim() == 2:
@@ -20,11 +20,12 @@ class LuongAttention(nn.Module):
         attn_scores = torch.bmm(hidden, proj_enc.transpose(1, 2))  # [B, 1, S]
 
         if src_mask is not None:
-            mask = src_mask.unsqueeze(1)  # [B,1,S]
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+            mask = src_mask.unsqueeze(1)  # [B, 1, S]
+            # ✅ AMP-safe masking (works for fp16 / bf16 / fp32)
+            attn_scores = attn_scores.masked_fill(mask == 0, torch.finfo(attn_scores.dtype).min)
 
-        attn_weights = F.softmax(attn_scores, dim=-1)  # [B,1,S]
-        context = torch.bmm(attn_weights, encoder_outputs)  # [B,1,H]
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [B, 1, S]
+        context = torch.bmm(attn_weights, encoder_outputs)  # [B, 1, H]
         return context, attn_weights
 
 
@@ -64,7 +65,7 @@ class Seq2SeqLSTMAttn(nn.Module):
             dropout=dropout if num_layers > 1 else 0
         )
 
-        # IMPORTANT: keep this name to match checkpoint keys:
+        # IMPORTANT: keep this name to match checkpoint keys
         self.attention = LuongAttention(dec_hidden)
 
         self.h_bridge = nn.Linear(self.enc_out_dim, dec_hidden)
@@ -101,8 +102,6 @@ class Seq2SeqLSTMAttn(nn.Module):
 
             dec_out, decoder_hidden = self.decoder(rnn_input, decoder_hidden)
 
-            # NOTE: this is as in your training setup (keep it to load checkpoint)
-            # Even if imperfect dimensionally, we keep it for compatibility.
             context, _ = self.attention(dec_out, enc_output, src_mask)
 
             concat_input = torch.cat([dec_out, context], dim=2)
@@ -131,10 +130,10 @@ class Seq2SeqLSTMAttn(nn.Module):
         repetition_penalty=1.15
     ):
         """
-        Fixed generation:
-        - Works for batch size > 1
-        - Stops per-sample at EOS
-        - Adds repetition controls to avoid "b b b b ..."
+        Generation:
+        - batch-safe
+        - stops per-sample at EOS
+        - repetition controls
         Returns: List[List[int]] (each includes BOS then generated tokens)
         """
         if bos_id is None or eos_id is None:
@@ -157,14 +156,13 @@ class Seq2SeqLSTMAttn(nn.Module):
 
         decoder_hidden = (dec_h, dec_c)
 
-        # Start tokens
-        ys = torch.full((B, 1), bos_id, dtype=torch.long, device=device)  # [B,1]
+        ys = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
         context = torch.zeros(B, 1, self.enc_out_dim, device=device)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
 
         for _ in range(max_len):
-            decoder_input = ys[:, -1:]  # last token
-            tgt_emb = self.dropout(self.tgt_embedding(decoder_input))  # [B,1,E]
+            decoder_input = ys[:, -1:]
+            tgt_emb = self.dropout(self.tgt_embedding(decoder_input))
 
             rnn_input = torch.cat([tgt_emb, context], dim=2)
             dec_out, decoder_hidden = self.decoder(rnn_input, decoder_hidden)
@@ -197,9 +195,10 @@ class Seq2SeqLSTMAttn(nn.Module):
                             if prefix + (cand,) in ngrams:
                                 banned.append(cand)
                         if banned:
-                            logits[b, banned] = -1e9
+                            # ✅ AMP-safe "very negative"
+                            logits[b, banned] = torch.finfo(logits.dtype).min
 
-            next_token = torch.argmax(logits, dim=-1)  # [B]
+            next_token = torch.argmax(logits, dim=-1)
             next_token = torch.where(
                 finished,
                 torch.tensor(eos_id, device=device),
