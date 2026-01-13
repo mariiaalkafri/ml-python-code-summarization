@@ -11,6 +11,7 @@ sys.path.append(os.path.abspath("."))
 
 from src.data import JsonlCodeSummaryDataset, Collator
 from src.transformer_model import TransformerSeq2Seq
+from src.train_utils_transformer import train_transformer_model
 
 def _bucket_index(value: int, thresholds: List[int]) -> int:
     for i, t in enumerate(thresholds):
@@ -79,50 +80,7 @@ def pick_2d_stratified_subset(
     rng.shuffle(subset)
     return subset, bucket_report
 
-def generate_square_subsequent_mask(sz, device):
-    mask = (torch.triu(torch.ones((sz, sz), device=device)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-    return mask
 
-def train_step_transformer(model, batch, criterion, optimizer, device):
-    model.train()
-    
-    src_ids = batch.src_ids.to(device)
-    src_mask = batch.src_mask.to(device) # 1 for valid, 0 for pad
-    tgt_ids = batch.tgt_ids.to(device)
-    
-    # Create masks
-    src_key_padding_mask = (src_mask == 0)
-    
-    # tgt inputs (exclude last token) -> [B, T-1]
-    tgt_input = tgt_ids[:, :-1]
-    # tgt targets (exclude first token <bos>) -> [B, T-1]
-    tgt_target = tgt_ids[:, 1:]
-    
-    pad_id = model.pad_id
-    tgt_key_padding_mask = (tgt_input == pad_id)
-    
-    # Causal mask
-    tgt_seq_len = tgt_input.size(1)
-    tgt_mask = generate_square_subsequent_mask(tgt_seq_len, device)
-    
-    outputs = model(
-        src_ids=src_ids, 
-        tgt_ids=tgt_input, 
-        src_key_padding_mask=src_key_padding_mask,
-        tgt_key_padding_mask=tgt_key_padding_mask,
-        tgt_mask=tgt_mask
-    )
-    
-    loss = criterion(outputs.reshape(-1, outputs.size(-1)), tgt_target.reshape(-1))
-    
-    optimizer.zero_grad()
-    loss.backward()
-    
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-    
-    return loss.item()
 
 def main():
     tokenizer_path = "data/tokenizer/tokenizer.json"
@@ -214,51 +172,19 @@ def main():
 
     print("Starting training...")
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = torch.nn.CrossEntropyLoss(ignore_index=pad_id)
-    
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        
-        for batch in train_loader:
-            loss = train_step_transformer(model, batch, criterion, optimizer, device)
-            total_loss += loss
-            
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}")
-        
-        # Validation
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                src_ids = batch.src_ids.to(device)
-                src_mask = batch.src_mask.to(device)
-                tgt_ids = batch.tgt_ids.to(device)
-                
-                src_key_padding_mask = (src_mask == 0)
-                tgt_input = tgt_ids[:, :-1]
-                tgt_target = tgt_ids[:, 1:]
-                tgt_seq_len = tgt_input.size(1)
-                tgt_mask = generate_square_subsequent_mask(tgt_seq_len, device)
-                tgt_key_padding_mask = (tgt_input == pad_id)
-                
-                outputs = model(
-                    src_ids=src_ids, 
-                    tgt_ids=tgt_input, 
-                    src_key_padding_mask=src_key_padding_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                    tgt_mask=tgt_mask
-                )
-                
-                loss_val = criterion(outputs.reshape(-1, outputs.size(-1)), tgt_target.reshape(-1))
-                val_loss += loss_val.item()
-                
-        print(f"Val Loss: {val_loss / len(val_loader):.4f}")
-        
-        # Save
-        torch.save(model.state_dict(), os.path.join(save_dir, "best_transformer.pt"))
+    train_transformer_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        pad_id=pad_id,
+        epochs=epochs,
+        lr=lr,
+        weight_decay=weight_decay,
+        save_dir=save_dir,
+        log_every=200,
+        clip_grad=1.0,
+    )
 
 if __name__ == "__main__":
     main()
