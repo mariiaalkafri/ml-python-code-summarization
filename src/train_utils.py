@@ -42,7 +42,8 @@ def save_checkpoint(path, model, optimizer, epoch, val_loss, best_val):
 
 def run_epoch(
     model, dataloader, optimizer, criterion, device,
-    train=True, clip_grad=1.0, log_every=200, pad_id=0
+    train=True, clip_grad=1.0, log_every=200, pad_id=0,
+    scaler=None
 ):
     model.train() if train else model.eval()
 
@@ -51,6 +52,7 @@ def run_epoch(
     total_tokens = 0
 
     start = time.time()
+    use_amp = (device.startswith("cuda") and scaler is not None)
 
     for i, batch in enumerate(dataloader):
         src_ids = batch.src_ids.to(device, non_blocking=True)
@@ -61,16 +63,43 @@ def run_epoch(
         tgt_out = tgt_ids[:, 1:]
 
         if train:
-            optimizer.zero_grad()
-            logits = model(src_ids, src_mask, tgt_in)
-            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    logits = model(src_ids, src_mask, tgt_in)
+                    loss = criterion(
+                        logits.reshape(-1, logits.size(-1)),
+                        tgt_out.reshape(-1)
+                    )
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(src_ids, src_mask, tgt_in)
+                loss = criterion(
+                    logits.reshape(-1, logits.size(-1)),
+                    tgt_out.reshape(-1)
+                )
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                optimizer.step()
         else:
             with torch.no_grad():
-                logits = model(src_ids, src_mask, tgt_in)
-                loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        logits = model(src_ids, src_mask, tgt_in)
+                        loss = criterion(
+                            logits.reshape(-1, logits.size(-1)),
+                            tgt_out.reshape(-1)
+                        )
+                else:
+                    logits = model(src_ids, src_mask, tgt_in)
+                    loss = criterion(
+                        logits.reshape(-1, logits.size(-1)),
+                        tgt_out.reshape(-1)
+                    )
 
         total_loss += loss.item()
 
@@ -108,6 +137,9 @@ def train_model(
     start_epoch = 1
     best_val = float("inf")
 
+    # ✅ AMP scaler (only active on CUDA)
+    scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda"))
+
     # ✅ RESUME
     if resume_path is not None and os.path.exists(resume_path):
         print(f"Resuming from checkpoint: {resume_path}")
@@ -120,16 +152,24 @@ def train_model(
     elif resume_path is not None:
         print(f"Resume checkpoint not found at: {resume_path} (starting fresh)")
 
+    # Safety print (prevents confusion)
+    print(f"Will train from epoch {start_epoch} to {epochs_total}")
+    if start_epoch > epochs_total:
+        print("Nothing to do: start_epoch > epochs_total. Increase epochs_total or disable resume.")
+        return
+
     for epoch in range(start_epoch, epochs_total + 1):
         start_time = time.time()
 
         train_loss, train_acc = run_epoch(
             model, train_loader, optimizer, criterion, device,
-            train=True, clip_grad=clip_grad, log_every=log_every, pad_id=pad_id
+            train=True, clip_grad=clip_grad, log_every=log_every, pad_id=pad_id,
+            scaler=scaler
         )
         val_loss, val_acc = run_epoch(
             model, val_loader, optimizer, criterion, device,
-            train=False, pad_id=pad_id
+            train=False, pad_id=pad_id,
+            scaler=scaler
         )
 
         elapsed = time.time() - start_time
@@ -139,7 +179,6 @@ def train_model(
 
         scheduler.step(val_loss)
 
-        # ✅ Update best first, then save checkpoints cleanly
         if val_loss < best_val:
             best_val = val_loss
             save_checkpoint(f"{save_dir}/best.pt", model, optimizer, epoch, val_loss, best_val)
