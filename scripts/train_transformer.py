@@ -1,111 +1,118 @@
-import sys
 import os
+import sys
 import random
 from typing import List, Dict, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
-# Ensure we can import from src (repo root)
 sys.path.append(os.path.abspath("."))
 
 from src.data import JsonlCodeSummaryDataset, Collator
 from src.transformer_model import TransformerSeq2Seq
-from src.train_utils_transformer import train_transformer_model
+from src.train_utils_transformer import train_model  # <-- make it same style as LSTM
 
-def _bucket_index(value: int, thresholds: List[int]) -> int:
-    for i, t in enumerate(thresholds):
-        if value <= t:
+
+def _bucket_index(value: int, boundaries: List[int]) -> int:
+    for i, b in enumerate(boundaries):
+        if value <= b:
             return i
-    return len(thresholds)
+    return len(boundaries)
+
 
 def pick_2d_stratified_subset(
     examples: List[Dict],
     n: int,
     seed: int = 42,
-    code_thresholds: List[int] = None,
-    sum_thresholds: List[int] = None,
+    code_boundaries: List[int] = None,
+    sum_boundaries: List[int] = None,
+    code_buckets: int = 5,
+    sum_buckets: int = 3,
 ) -> Tuple[List[Dict], List[Tuple[Tuple[int, int], int, int]]]:
     if n is None or n >= len(examples):
         return examples, []
 
     rng = random.Random(seed)
 
-    if code_thresholds is None:
-        code_thresholds = [200, 600, 1200, 2000]
-    if sum_thresholds is None:
-        sum_thresholds = [60, 120]
+    if code_boundaries is None:
+        code_boundaries = [200, 600, 1200, 2400]
+    if sum_boundaries is None:
+        sum_boundaries = [40, 90]
 
-    buckets = {}
+    cells = {(i, j): [] for i in range(code_buckets) for j in range(sum_buckets)}
+
     for ex in examples:
         code_len = len(ex.get("code", ""))
         sum_len = len(ex.get("summary", ""))
-        cb = _bucket_index(code_len, code_thresholds)
-        sb = _bucket_index(sum_len, sum_thresholds)
-        key = (cb, sb)
-        buckets.setdefault(key, []).append(ex)
+        cb = min(_bucket_index(code_len, code_boundaries), code_buckets - 1)
+        sb = min(_bucket_index(sum_len, sum_boundaries), sum_buckets - 1)
+        cells[(cb, sb)].append(ex)
 
     total = len(examples)
-    ideal = {}
-    for key, bucket_list in buckets.items():
-        ideal[key] = n * (len(bucket_list) / total)
+    quotas = {k: int(round(n * (len(v) / total))) for k, v in cells.items()}
 
-    quotas = {k: int(v) for k, v in ideal.items()}
-    taken = sum(quotas.values())
-
-    remainder = n - taken
-    if remainder > 0:
-        fracs = sorted(
-            [(k, ideal[k] - quotas[k]) for k in quotas.keys()],
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        for i in range(remainder):
-            quotas[fracs[i % len(fracs)][0]] += 1
+    qsum = sum(quotas.values())
+    if qsum != n:
+        keys_sorted = sorted(cells.keys(), key=lambda k: len(cells[k]), reverse=True)
+        diff = n - qsum
+        idx = 0
+        while diff != 0 and idx < len(keys_sorted) * 10:
+            k = keys_sorted[idx % len(keys_sorted)]
+            if diff > 0:
+                quotas[k] += 1
+                diff -= 1
+            else:
+                if quotas[k] > 0:
+                    quotas[k] -= 1
+                    diff += 1
+            idx += 1
 
     subset = []
-    bucket_report = []
-    for key in sorted(buckets.keys()):
-        bucket_list = buckets[key]
-        q = quotas.get(key, 0)
-        bucket_report.append((key, len(bucket_list), q))
-
+    for cell_key, cell_list in cells.items():
+        q = quotas[cell_key]
         if q <= 0:
             continue
-        if q >= len(bucket_list):
-            subset.extend(bucket_list)
+        if q >= len(cell_list):
+            subset.extend(cell_list)
         else:
-            subset.extend(rng.sample(bucket_list, q))
+            subset.extend(rng.sample(cell_list, q))
 
     rng.shuffle(subset)
-    return subset, bucket_report
-
+    subset = subset[:n]
+    return subset, []
 
 
 def main():
     tokenizer_path = "data/tokenizer/tokenizer.json"
-    train_path = "data/processed/train.jsonl"
-    val_path = "data/processed/valid.jsonl"
+
+    # ✅ align with YOUR pipeline outputs
+    train_path = "data/processed/train_mix_70strong_30light_final_sanitized.jsonl"
+    val_path   = "data/processed/valid_mix_70strong_30light_final_sanitized.jsonl"
 
     batch_size = 32
     max_src_len = 256
     max_tgt_len = 64
-
-    epochs = 10
     lr = 3e-4
     weight_decay = 0.01
+    clip_grad = 1.0
+    log_every = 200
 
+    epochs_total = 25
     SUBSET_TRAIN = 50_000
-    SUBSET_VAL = 5_000
+    SUBSET_VAL = 8_000
     SEED = 42
 
-    save_dir = "/content/drive/MyDrive/ml-python-code-summarization/models_transformer" # Changed dir
+    RESUME_PATH = None
+    SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_transformer_fromscratch"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    print(f"Train file: {train_path}")
+    print(f"Val file:   {val_path}")
+    print(f"Resume: {RESUME_PATH}")
+    print(f"Save dir: {SAVE_DIR}")
 
-    os.makedirs(save_dir, exist_ok=True)
-    print(f"Save dir: {save_dir}")
+    os.makedirs(SAVE_DIR, exist_ok=True)
 
     collator = Collator(tokenizer_path, max_src_len=max_src_len, max_tgt_len=max_tgt_len)
     pad_id = collator.pad_id
@@ -114,28 +121,14 @@ def main():
     print("Loading datasets...")
     train_dataset = JsonlCodeSummaryDataset(train_path)
     val_dataset = JsonlCodeSummaryDataset(val_path)
-
     print(f"Full train examples: {len(train_dataset)}")
-    print(f"Full val examples: {len(val_dataset)}")
+    print(f"Full val examples:   {len(val_dataset)}")
 
-    train_subset, train_report = pick_2d_stratified_subset(
-        train_dataset.examples, SUBSET_TRAIN, seed=SEED
-    )
-    val_subset, _ = pick_2d_stratified_subset(
-        val_dataset.examples, SUBSET_VAL, seed=SEED
-    )
-
+    train_subset, _ = pick_2d_stratified_subset(train_dataset.examples, SUBSET_TRAIN, seed=SEED)
+    val_subset, _ = pick_2d_stratified_subset(val_dataset.examples, SUBSET_VAL, seed=SEED)
     train_dataset.examples = train_subset
     val_dataset.examples = val_subset
-
-    print(f"Subset (2D stratified): selected {len(train_dataset)}")
-    if train_report:
-        print("Bucket report: (code_bucket, sum_bucket)  total_in_cell  quota")
-        for (cb, sb), total_in_cell, quota in train_report:
-            print(f"  ({cb},{sb})  total={total_in_cell}  quota={quota}")
-
-    print(f"Using subset sizes -> train={len(train_dataset)}  val={len(val_dataset)}")
-    print(f"Hyperparams -> batch={batch_size} src_len={max_src_len} tgt_len={max_tgt_len} epochs={epochs} lr={lr}")
+    print(f"Subset selected -> train={len(train_dataset)}  val={len(val_dataset)}")
 
     print("Building dataloaders...")
     train_loader = DataLoader(
@@ -144,7 +137,7 @@ def main():
         shuffle=True,
         collate_fn=collator,
         num_workers=2,
-        pin_memory=True,
+        pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset,
@@ -152,11 +145,8 @@ def main():
         shuffle=False,
         collate_fn=collator,
         num_workers=2,
-        pin_memory=True,
+        pin_memory=True
     )
-
-    print(f"Train batches/epoch: {len(train_loader)}")
-    print(f"Val batches/epoch: {len(val_loader)}")
 
     print("Initializing Transformer model...")
     model = TransformerSeq2Seq(
@@ -167,24 +157,25 @@ def main():
         num_decoder_layers=4,
         dim_feedforward=1024,
         dropout=0.1,
-        pad_id=pad_id,
+        pad_id=pad_id
     ).to(device)
 
-    print("Starting training...")
-    
-    train_transformer_model(
+    print("Starting training FROM SCRATCH...")
+    train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
         pad_id=pad_id,
-        epochs=epochs,
+        epochs_total=epochs_total,
         lr=lr,
         weight_decay=weight_decay,
-        save_dir=save_dir,
-        log_every=200,
-        clip_grad=1.0,
+        save_dir=SAVE_DIR,
+        resume_path=RESUME_PATH,
+        log_every=log_every,
+        clip_grad=clip_grad
     )
+
 
 if __name__ == "__main__":
     main()
