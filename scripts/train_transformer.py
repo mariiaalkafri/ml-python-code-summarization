@@ -85,7 +85,6 @@ def pick_2d_stratified_subset(
 def main():
     tokenizer_path = "data/tokenizer/tokenizer.json"
 
-    # ✅ your real pipeline outputs
     train_path = "data/processed/train_mix_70strong_30light_final_sanitized.jsonl"
     val_path   = "data/processed/valid_mix_70strong_30light_final_sanitized.jsonl"
 
@@ -93,9 +92,9 @@ def main():
     max_src_len = 256
     max_tgt_len = 64
 
-    # ✅ Continue training after 25
-    epochs_total = 60
-    lr = 1e-4  # ✅ smaller LR for fine-tuning
+    # ✅ continue training (fine-tune stage)
+    epochs_total = 40
+    lr = 1e-4
     weight_decay = 0.01
     clip_grad = 1.0
     log_every = 200
@@ -105,8 +104,6 @@ def main():
     SEED = 42
 
     SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_transformer_fromscratch"
-
-    # ✅ Resume from last checkpoint
     RESUME_PATH = f"{SAVE_DIR}/last.pt"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
