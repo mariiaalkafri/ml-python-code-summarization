@@ -109,7 +109,7 @@ def main():
     log_every = 200
 
     # ✅ Fine-tune for fewer epochs (early stopping will handle the rest)
-    epochs_total = 10
+    epochs_total = 20
 
     # ✅ Subset (increase since dataset is now cleaner and larger)
     # If you want full dataset, set SUBSET_TRAIN=None and SUBSET_VAL=None
