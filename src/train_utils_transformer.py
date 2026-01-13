@@ -119,9 +119,11 @@ def train_model(
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=1, min_lr=1e-6
     )
-    criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
-    early_stopping = EarlyStopping(patience=4, min_delta=0.001)
 
+    # ✅ SAFE IMPROVEMENT: label smoothing
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_id, label_smoothing=0.1)
+
+    early_stopping = EarlyStopping(patience=4, min_delta=0.001)
     os.makedirs(save_dir, exist_ok=True)
 
     start_epoch = 1
@@ -129,6 +131,7 @@ def train_model(
 
     scaler = torch.amp.GradScaler("cuda", enabled=device.startswith("cuda"))
 
+    # ✅ RESUME
     if resume_path is not None and os.path.exists(resume_path):
         print(f"Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
@@ -167,11 +170,13 @@ def train_model(
 
         scheduler.step(val_loss)
 
+        # Save best
         if val_loss < best_val:
             best_val = val_loss
             save_checkpoint(f"{save_dir}/best.pt", model, optimizer, epoch, val_loss, best_val)
             print("  ✔ Saved new best model")
 
+        # Save last
         save_checkpoint(f"{save_dir}/last.pt", model, optimizer, epoch, val_loss, best_val)
 
         early_stopping(val_loss)
