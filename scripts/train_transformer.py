@@ -10,7 +10,7 @@ sys.path.append(os.path.abspath("."))
 
 from src.data import JsonlCodeSummaryDataset, Collator
 from src.transformer_model import TransformerSeq2Seq
-from src.train_utils_transformer import train_model  # <-- make it same style as LSTM
+from src.train_utils_transformer import train_model
 
 
 def _bucket_index(value: int, boundaries: List[int]) -> int:
@@ -85,25 +85,29 @@ def pick_2d_stratified_subset(
 def main():
     tokenizer_path = "data/tokenizer/tokenizer.json"
 
-    # ✅ align with YOUR pipeline outputs
+    # ✅ your real pipeline outputs
     train_path = "data/processed/train_mix_70strong_30light_final_sanitized.jsonl"
     val_path   = "data/processed/valid_mix_70strong_30light_final_sanitized.jsonl"
 
     batch_size = 32
     max_src_len = 256
     max_tgt_len = 64
-    lr = 3e-4
+
+    # ✅ Continue training after 25
+    epochs_total = 60
+    lr = 1e-4  # ✅ smaller LR for fine-tuning
     weight_decay = 0.01
     clip_grad = 1.0
     log_every = 200
 
-    epochs_total = 25
     SUBSET_TRAIN = 50_000
     SUBSET_VAL = 8_000
     SEED = 42
 
-    RESUME_PATH = None
     SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_transformer_fromscratch"
+
+    # ✅ Resume from last checkpoint
+    RESUME_PATH = f"{SAVE_DIR}/last.pt"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -160,7 +164,7 @@ def main():
         pad_id=pad_id
     ).to(device)
 
-    print("Starting training FROM SCRATCH...")
+    print("Starting training (resume if checkpoint exists)...")
     train_model(
         model=model,
         train_loader=train_loader,
