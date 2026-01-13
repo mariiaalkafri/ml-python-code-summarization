@@ -93,7 +93,7 @@ def main():
     max_tgt_len = 64
 
     # ✅ continue training (fine-tune stage)
-    epochs_total = 40
+    epochs_total = 60
     lr = 1e-4
     weight_decay = 0.01
     clip_grad = 1.0
